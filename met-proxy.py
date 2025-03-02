@@ -10,7 +10,6 @@ import time
 import traceback
 from enum import StrEnum
 from http import client
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pprint import pprint
 from threading import Event, Lock
 from typing import (
@@ -21,8 +20,8 @@ from typing import (
     TypedDict
 )
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlparse
 
+import aiohttp.web as web
 import httpx
 
 hostName = os.environ.get("BIND_ADDR", "0.0.0.0")
@@ -33,7 +32,6 @@ maxItemsInCache = int(os.environ.get("MAX_ITEMS_IN_CACHE", 10000))
 maxItemsIn422Cache = int(os.environ.get("MAX_ITEMS_IN_CACHE_422", 100000))
 debug = os.environ.get("DEBUG", "0").lower() == "1"
 asyncClient = httpx.AsyncClient()
-eventLoop = asyncio.new_event_loop()
 
 cacheLock = Lock()
 cache = {}
@@ -285,10 +283,13 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
                     cache422[(lat, lon, MetAPIType.NOWCAST)] = True
                 # Do not raise the exception here, as we want to try the locationforecast api
 
-    # Start async requests in parallel
-    nveAvalancheResp = requestFromNveAvalanche(lat, lon)
-    metAlertResp = requestFromMetAPI(lat, lon, MetAPIType.METALERTS, userAgent)
-    locationIQResp = requestFromLocationIQ(lat, lon, locationIqApiKey)
+    # Schedule all the requests to run concurrently
+    nveAvalancheResp, metAlertResp, locationIQResp = await asyncio.gather(
+        requestFromNveAvalanche(lat, lon),
+        requestFromMetAPI(lat, lon, MetAPIType.METALERTS, userAgent),
+        requestFromLocationIQ(lat, lon, locationIqApiKey),
+        return_exceptions=True  # Return exceptions instead of raising them
+    )
 
     locationForecast = {}
     if not nowcast:
@@ -299,25 +300,24 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
 
     # Check for avalanche warnings first, then metalert warnings
     warningIcon = None
-    try:
-        warningIcon = getNveAvalancheWarningIcon(await nveAvalancheResp)
-    except BaseException:
-        printColor(traceback.format_exc(), color=bcolors.BROWN)
+    if not isinstance(nveAvalancheResp, BaseException):
+        warningIcon = getNveAvalancheWarningIcon(nveAvalancheResp)
+    else:
+        printColor(traceback.format_exception(nveAvalancheResp), color=bcolors.BROWN)
 
-    if warningIcon is None:
-        try:
-            _, data = await metAlertResp
-            warningIcon = getMetAlertWarningIcon(data)
-        except BaseException:
-            printColor(traceback.format_exc(), color=bcolors.BROWN)
+    if not isinstance(metAlertResp, BaseException):
+        if warningIcon is None:
+            warningIcon = getMetAlertWarningIcon(metAlertResp[1])
+    else:
+        printColor(traceback.format_exception(metAlertResp), color=bcolors.BROWN)
 
     locationIQ = {}
-    try:
+    if not isinstance(locationIQResp, BaseException):
+        locationIQ = locationIQResp
+    else:
         # If this fails it is not critical, so we can ignore it - we'll return
         # the lat, lon as the location name
-        locationIQ = await locationIQResp
-    except BaseException:
-        printColor(traceback.format_exc(), color=bcolors.BROWN)
+        printColor(traceback.format_exception(locationIQResp), color=bcolors.BROWN)
 
     resp = prepareResponse(lat, lon, nowcast, locationForecast, locationIQ, warningIcon)
 
@@ -331,71 +331,55 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
     return respBytes
 
 
-class HttpRequestHandler(BaseHTTPRequestHandler):
-    def parseIncomingRequest(self) -> Tuple[float, float, str]:
-        data = urlparse(self.path)
-        path = data.path.replace("/", "")
-        if path:
-            raise ValueError(
-                "Error: expecting GET request without path")
+def parseRequest(qs):
+    if 'lat' not in qs or 'lon' not in qs:
+        printColor(qs, color=bcolors.RED)
+        raise web.HTTPBadRequest(reason=
+            "Error: expecting GET request with lat and lon parameters")
 
-        qs = parse_qs(data.query)
-        if 'lat' not in qs or 'lon' not in qs:
-            printColor(data, color=bcolors.RED)
-            printColor(qs, color=bcolors.RED)
-            raise ValueError(
-                "Error: expecting GET request with lat and lon parameters")
+    lat, lon = float(qs['lat']), float(qs['lon'])
+    if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+        raise web.HTTPBadRequest(reason=
+            "Error: lat and lon must be between -90 and 90 and -180 and 180 respectively")
 
-        lat, lon = float(qs['lat'][0]), float(qs['lon'][0])
-        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
-            raise ValueError(
-                "Error: lat and lon must be between -90 and 90 and -180 and 180 respectively")
+    locationIqKey = qs.get("locationIqApiKey", "")
 
-        locationIqKey = ""
-        try:
-            locationIqKey = qs['locationIqApiKey'][0]
-        except KeyError:
-            pass
+    return lat, lon, locationIqKey
 
-        return lat, lon, locationIqKey
 
-    def do_GET(self):
-        userAgent = userAgentDefault
-        if allowOverrideUserAgent:
-            userAgent = self.headers.get("User-Agent", userAgentDefault)
+async def handleRequest(request: web.Request) -> web.Response:
+    userAgent = userAgentDefault
+    if allowOverrideUserAgent:
+        userAgent = request.headers.get("User-Agent", userAgentDefault)
+
+    printColor(
+        f" - Serving Incoming request {bcolors.BOLD}{request.path_qs} with User-Agent: {userAgent}",
+        color=bcolors.PURPLE)
+
+    try:
+        lat, lon, locationIqApiKey = parseRequest(request.query)
+
+        with cacheLock:
+            dataExpires, data = cache.get((lat, lon), (None, None))
+
+        if data is None or dataExpires < time.time():
+            data = await getHolisticResponse(lat, lon, userAgent, locationIqApiKey)
+        else:
+            printColor(f"Serving cached data for {request.path_qs} - cache expires in {int(dataExpires - time.time())} seconds", color=bcolors.YELLOW)
+
         printColor(
-            f" - Serving Incoming request {bcolors.BOLD}{self.path} with User-Agent: {userAgent}",
-            color=bcolors.PURPLE)
+            f" - Serving data for {request.path_qs}", color=bcolors.BOLD + bcolors.GREEN)
+        if debug:
+            pprint(json.loads(data), compact=True)
+            sys.stdout.flush()
 
-        try:
-            lat, lon, locationIqApiKey = self.parseIncomingRequest()
-            with cacheLock:
-                dataExpires, data = cache.get((lat, lon), (None, None))
-            if data is None or dataExpires < time.time():
-                data = eventLoop.run_until_complete(getHolisticResponse(lat, lon, userAgent, locationIqApiKey))
-            else:
-                printColor(f"Serving cached data for {self.path} - cache expires in {int(dataExpires - time.time())} seconds", color=bcolors.YELLOW)
-
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            printColor(
-                f" - Serving data for {self.path}", color=bcolors.BOLD + bcolors.GREEN)
-            if debug:
-                pprint(json.loads(data), compact=True)
-                sys.stdout.flush()
-
-            self.wfile.write(data)
-        except BrokenPipeError:
-            printColor(
-                "Broken pipe - won't respond to the client",
-                color=bcolors.RED)
-        except HTTPError as e:
-            printColor(f"HTTP Error requesting {e.url}: {e}", color=bcolors.RED)
-            self.send_error(e.code, e.msg)
-        except BaseException:
-            printColor(traceback.format_exc(), color=bcolors.RED)
-            self.send_error(408)
+        return web.Response(text=data.decode('utf-8'), content_type="application/json")
+    except web.HTTPError as e:
+        print(f"HTTP Error requesting {e}")
+        return e
+    except BaseException:
+        printColor(traceback.format_exc(), color=bcolors.RED)
+        return web.HTTPRequestTimeout(reason="Error: Request Timeout")
 
 
 if __name__ == "__main__":
@@ -405,22 +389,16 @@ if __name__ == "__main__":
     cleanupThread = threading.Thread(target=cleanupCacheThread)
     cleanupThread.start()
 
-    # Start the server
-    webServer = ThreadingHTTPServer(
-        (hostName, serverPort), HttpRequestHandler)
     printColor(f"api.met.no proxy started http://{hostName}:{serverPort}", color=bcolors.WHITE)
     printColor(f"Default user-agent: '{userAgentDefault}'", color=bcolors.YELLOW)
-    for apitype in MetAPIType:
-        printColor(f"Accepting requests http://{hostName}:{serverPort}?lat=XX.XXXX&lon=YY.YYYY&locationIqApiKey=<API-KEY>", color=bcolors.WHITE)
+    printColor(f"Accepting requests http://{hostName}:{serverPort}?lat=XX.XXXX&lon=YY.YYYY&locationIqApiKey=<API-KEY>", color=bcolors.WHITE)
 
-    try:
-        webServer.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    # Start the server
+    app = web.Application()
+    app.router.add_get("/", handleRequest)
+    web.run_app(app, host=hostName, port=serverPort)
 
     signalCleanupThreadExit.set()
-
-    webServer.server_close()
     cleanupThread.join()
 
     printColor("Server stopped.", color=bcolors.WHITE)
