@@ -281,12 +281,12 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
        If not, the lat, lon is used instead as the "locationName".
     """
 
-    expireTimestamp = 0
+    nowcast_expire = 0
     nowcast = {}
     async with cache422Lock:
         if (lat, lon, MetAPIType.NOWCAST) not in cache422:
             try:
-                expireTimestamp, nowcast = await requestFromMetAPI(lat, lon, MetAPIType.NOWCAST, userAgent, session)
+                nowcast_expire, nowcast = await requestFromMetAPI(lat, lon, MetAPIType.NOWCAST, userAgent, session)
             except aiohttp.ClientResponseError as e:
                 if e.status == 422:
                     printColor(f"Received 422 nowcast response for {lat}, {lon} - adding location to cache422", color=bcolors.RED)
@@ -301,9 +301,10 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
     locationIQResp = asyncio.create_task(requestFromLocationIQ(lat, lon, locationIqApiKey, session))
     locationForecastResp = asyncio.create_task(requestFromMetAPI(lat, lon, MetAPIType.LOCATIONFORECAST, userAgent, session))
 
+    locationForecast_expire = 0
     locationForecast = {}
     try:
-        expireTimestamp, locationForecast = await locationForecastResp
+        locationForecast_expire, locationForecast = await locationForecastResp
     except BaseException:
         if not nowcast:
             # We don't have any weather data at all, so re-raise
@@ -335,6 +336,7 @@ async def getHolisticResponse(lat: float, lon: float, userAgent: str, locationIq
     resp = prepareResponse(lat, lon, nowcast, locationForecast, locationIQ, warningIcon)
 
     respBytes = json.dumps(resp).encode()
+    expireTimestamp = min(nowcast_expire, locationForecast_expire)
 
     printColor(f"Caching response - cache will be valid for {int(expireTimestamp - time.time())} seconds", color=bcolors.YELLOW)
     async with cacheLock:
